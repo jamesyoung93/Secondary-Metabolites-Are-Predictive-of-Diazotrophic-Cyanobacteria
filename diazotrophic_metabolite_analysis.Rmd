@@ -1,0 +1,376 @@
+---
+title: "CyanoMetDB"
+author: "James Young"
+date: "2025-01-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+
+
+
+
+
+
+```{r, prepare-data, message=FALSE, warning=FALSE}
+suppressWarnings(suppressPackageStartupMessages(library(dplyr)))
+# =============== Libraries ===============
+# Minimal usage of dplyr to avoid conflicts with select(); we keep it for other helpful verbs.
+# If you prefer to remove dplyr altogether, comment out library(dplyr) and use only base R indexing.
+library(here)
+library(readr)
+library(dplyr)   # We'll be careful to avoid the select() conflict
+library(splitstackshape) # For cSplit if needed
+
+# =============== Reading Data ===============
+# 1) Load 'Met.csv' containing your base data with columns including: Strain, Fix label, etc.
+df2 <- read.csv(here("Met.csv"), stringsAsFactors = FALSE)
+
+# 2) Keep only rows where Fix is 0 or 1
+df3 <- df2[df2$Fix == 0 | df2$Fix == 1, ]
+
+# 3) Filter original df2 to match the Strain set from df3, remove Strain == "n.a." 
+df4 <- df2[df2$Strain %in% df3$Strain & df2$Strain != "n.a.", ]
+
+# 4) Read the full CyanoMetDB file. 
+#x <- read.csv(here("CyanoMetDB.csv"), fileEncoding="UTF-8-BOM", stringsAsFactors=FALSE)
+x <- read.csv(here("CyanoMetDB.csv"))
+
+# 5) Split multiple strain entries into separate rows
+x <- cSplit(x, "Strain", sep = ";", direction = "long")
+x <- cSplit(x, "Strain", sep = ",", direction = "long")
+
+# 6) Filter 'x' to keep only those rows with Strain present in df4
+x2 <- x[x$Strain %in% df4$Strain, ]
+
+# 7) Merge in the 'Fix' label. We'll do a left join with base R or minimal dplyr
+df4_sub <- df4[, c("Strain", "Fix")]       # keep only Strain, Fix from df4
+x2 <- left_join(x2, df4_sub, by = "Strain") # now x2 gains the Fix info
+x2 <- x2[!is.na(x2$Fix), ]
+
+# 8) Remove duplicates by CompoundName + Fix
+x3 <- x2 %>%
+  distinct(CompoundName, Fix, .keep_all = TRUE)
+
+# 9) Keep only the essential columns for modeling
+#    (CompoundName, Fix, SMILES).
+x3 <- x3[, c("CompoundName", "Fix", "SMILES")]
+
+# 10) Rename columns
+colnames(x3) <- c("name", "Fix", "SMILES")
+
+# 11) Save prepared data
+write_csv(x3, "prepared_data.csv")
+
+# Quick check: how balanced is the final data?
+cat("Proportion of 'Fix' = 1:", mean(x3$Fix), "\n")  # ~0.48 indicates near 48% for class=1
+
+```
+
+
+
+```{r, fingerprinting, message=FALSE, warning=FALSE}
+library(ChemmineR)
+library(ChemmineOB)
+
+# Here we create SDF sets from the SMILES in x3,
+# then generate atom pair descriptors.
+
+# 1) Example: SDF for the first 165 compounds
+sdfset <- smiles2sdf(x3$SMILES[1:165])
+
+# 2) Optionally export each SDF to separate files
+#    so you can visually inspect them or keep for archives.
+if(!dir.exists("SDF_files")) dir.create("SDF_files")
+for (i in seq_along(sdfset)) {
+  fname <- paste0("SDF_files/", "sdf", i, ".sdf")
+  ChemmineR::write.SDF(sdfset[[i]], file = fname) 
+}
+
+# 3) Combine individual SDF files back if needed
+files <- list.files("SDF_files", full.names = TRUE)
+check1 <- read.SDFset(files[1])
+for (i in 2:length(files)) {
+  check2 <- read.SDFset(files[i])
+  check1 <- c(check1, check2)
+}
+# 'check1' is now the combined SDFset from all files
+
+# 4) Create atom pair set
+apset <- sdf2ap(sdfset) 
+
+```
+
+
+
+
+```{r, model,  message=FALSE, warning=FALSE}
+# We treat each row of x3 as a labeled compound with known Fix = 0 or 1.
+# The logic: for each compound i, find the closest matching compound (by AP similarity),
+# then compute predicted probability = 0.5 +/- 0.5*(similarity).
+
+results <- NULL
+
+for (i in seq_len(nrow(x3))) {
+  # For compound i, we search the entire AP set 'apset' 
+  # and compare to its own entry, ignoring i-th self match with cutoff=0.01 type=3
+  # 'cmp.search()' returns indices sorted by descending similarity
+  # so result$index[2] is typically the best match except itself.
+  
+  # We'll search using the entire APSet
+  # but keep in mind result$index[1] might be the self-match, so we use index[2].
+  
+  result <- suppressMessages(cmp.search(apset, apset[i], type = 3, cutoff = 0.01))
+  
+  # We want to see the known fix label of the neighbor (result$index[2]) 
+  # vs the actual fix label of the compound i, plus the similarity score.
+  # We'll store them in 'pred' with columns:
+  #   neighbor_label, actual_label, similarity, neighbor_index
+  pred <- cbind(x3$Fix[result$index[2]],  # neighbor's fix
+                x3$Fix[i],               # actual fix
+                result$scores[2],        # neighbor's similarity
+                result$index[2])         # neighbor's index
+  
+  results <- rbind(results, pred)
+}
+
+# Convert NAs to 0 or handle them if needed
+# results[is.na(results)] <- 0  # If you want to coerce NAs to 0, be cautious
+
+# 1) Evaluate the fraction correct
+frac_correct <- mean(ifelse(results[,1] == results[,2], 1, 0))
+cat("LOOCV exact match fraction:", frac_correct, "\n")
+
+# 2) Class distribution
+cat("Mean of actual Fix in test set:", mean(results[,2]), "\n")
+
+# 3) Build a confusion matrix with caret
+library(caret)
+cm <- confusionMatrix(as.factor(results[,1]), as.factor(results[,2]))
+
+# Probability approach: P(diazo) = 0.5 ± 0.5 * similarity
+# If neighbor_label=1 => P=0.5 + 0.5*similarity
+# If neighbor_label=0 => P=0.5 - 0.5*similarity
+pred <- ifelse(results[,1] == 1,
+               0.5 + 0.5 * as.numeric(results[,3]),
+               0.5 - 0.5 * as.numeric(results[,3]))
+
+z <- cbind(pred, as.numeric(as.factor(results[,2])) - 1)
+z <- as.data.frame(z)
+
+# For gains/lift
+library(gains)
+# Generate a gains table using response = z$V2, predicted = z$pred
+dt2 <- gains(z$V2, z$pred, groups = 20, optimal=FALSE)
+print(dt2)
+
+# Confusion matrix custom plotting
+draw_confusion_matrix <- function(cm) {
+  layout(matrix(c(1,1,2)))
+  par(mar = c(2,2,2,2))
+  # Frame region
+  plot(c(100, 345), c(300, 450), type = "n", xlab = "", ylab = "",
+       xaxt = 'n', yaxt = 'n')
+  title('CONFUSION MATRIX', cex.main=2)
+  
+  # Create rectangles for each cell
+  rect(150, 430, 240, 370, col='#3F97D0')
+  text(195, 435, 'Non-Diazotrophic', cex=1.2)
+  rect(250, 430, 340, 370, col='#F7AD50')
+  text(295, 435, 'Diazotrophic', cex=1.2)
+  text(125, 370, 'Predicted', cex=1.3, srt=90, font=2)
+  text(245, 450, 'Actual', cex=1.3, font=2)
+  rect(150, 305, 240, 365, col='#F7AD50')
+  rect(250, 305, 340, 365, col='#3F97D0')
+  text(140, 400, 'Non-Diazotrophic', cex=1.2, srt=90)
+  text(140, 335, 'Diazotrophic', cex=1.2, srt=90)
+  
+  # Insert confusion matrix counts
+  counts <- as.numeric(cm$table)
+  text(195, 400, counts[1], cex=1.6, font=2, col='white')
+  text(195, 335, counts[2], cex=1.6, font=2, col='white')
+  text(295, 400, counts[3], cex=1.6, font=2, col='white')
+  text(295, 335, counts[4], cex=1.6, font=2, col='white')
+  
+  # Show stats on the right panel
+  plot(c(100, 0), c(100, 0), type = "n", xlab="", ylab="", 
+       main = "DETAILS", xaxt='n', yaxt='n')
+  
+  # Sensitivity, Specificity, etc.
+  byClass <- cm$byClass
+  text(10, 85, names(byClass[1]), cex=1.2, font=2)
+  text(10, 70, round(byClass[1], 3), cex=1.2)
+  text(30, 85, names(byClass[2]), cex=1.2, font=2)
+  text(30, 70, round(byClass[2], 3), cex=1.2)
+  text(50, 85, names(byClass[5]), cex=1.2, font=2)
+  text(50, 70, round(byClass[5], 3), cex=1.2)
+  text(70, 85, names(byClass[6]), cex=1.2, font=2)
+  text(70, 70, round(byClass[6], 3), cex=1.2)
+  text(90, 85, names(byClass[7]), cex=1.2, font=2)
+  text(90, 70, round(byClass[7], 3), cex=1.2)
+  
+  # Overall accuracy, Kappa
+  overall <- cm$overall
+  text(30, 35, names(overall[1]), cex=1.5, font=2)
+  text(30, 20, round(overall[1], 3), cex=1.4)
+  text(70, 35, names(overall[2]), cex=1.5, font=2)
+  text(70, 20, round(overall[2], 3), cex=1.4)
+}
+
+# Draw the confusion matrix
+draw_confusion_matrix(cm)
+
+# Compute AUC with ROCR
+library(ROCR)
+predROCR <- prediction(pred, results[,2])
+perfROCR <- performance(predROCR, "tpr", "fpr")
+plot(perfROCR, col='red', lty=1, lwd=3, main="Structural Similarity Model (LOOCV)")
+abline(a=0, b=1, lty=2)
+
+aucVal <- performance(predROCR, "auc")
+aucVal <- unlist(slot(aucVal, "y.values"))
+cat("LOOCV AUC =", round(aucVal, 3), "\n")
+
+```
+
+
+
+```{r, save-predictions, message=FALSE, warning=FALSE}
+# 1) Read entire CyanoMetDB to find unlabeled molecules
+allsmiles <- read_csv("CyanoMetDB.csv") %>%
+  distinct(SMILES, .keep_all = TRUE)
+
+# We'll define a 'not in' operator
+`%!in%` <- Negate(`%in%`)
+
+# Filter out molecules that are already in x3
+allsmiles <- allsmiles[allsmiles$SMILES %!in% x3$SMILES, ]
+
+# Create SDF & APset for all new molecules
+sdfsetAll <- smiles2sdf(allsmiles$SMILES)
+apsetAll <- sdf2ap(sdfsetAll)
+
+# 2) For each unlabeled molecule, find closest labeled neighbor & predict
+results_unlabeled <- NULL
+for (i in seq_along(apsetAll)) {
+  neighbor <- cmp.search(apset, apsetAll[i], type=3, cutoff=0.01)
+  # neighbor$index[1] = best match from labeled set (?)
+  
+  # We store: neighbor_label, compoundName, similarity
+  row_val <- c(x3$Fix[neighbor$index[1]],
+               allsmiles$CompoundName[i],
+               neighbor$scores[1])
+  results_unlabeled <- rbind(results_unlabeled, row_val)
+}
+
+# Convert columns to numeric where needed
+results_unlabeled <- as.data.frame(results_unlabeled, stringsAsFactors=FALSE)
+colnames(results_unlabeled) <- c("NeighborLabel","CompoundName","Similarity")
+results_unlabeled$NeighborLabel <- as.numeric(results_unlabeled$NeighborLabel)
+results_unlabeled$Similarity <- as.numeric(results_unlabeled$Similarity)
+
+# Probability formula
+pred_unl <- ifelse(results_unlabeled$NeighborLabel == 1,
+                   0.5 + 0.5*results_unlabeled$Similarity,
+                   0.5 - 0.5*results_unlabeled$Similarity)
+
+hist(pred_unl, breaks=20, main="Predicted Probabilities for Unlabeled Metabolites")
+
+results_unlabeled$PredProbability <- pred_unl
+write.csv(results_unlabeled, "AllUnknownPredictions.csv", row.names=FALSE)
+
+```
+
+
+```{r, save-predictions2, message=FALSE, warning=FALSE}
+df <- read_csv("AllUnknownPredictions.csv")
+df$PredProbability <- ifelse(df$NeighborLabel == 1,
+                             0.5 + 0.5*df$Similarity,
+                             0.5 - 0.5*df$Similarity)
+
+# Optionally rename columns
+colnames(df)[2] <- "CompoundName"
+
+# Example merges to group by Strain or Compound
+x <- read_csv("CyanoMetDB.csv")
+x <- cSplit(x, "Strain", sep=";", direction="long")
+x <- cSplit(x, "Strain", sep=",", direction="long")
+
+x2 <- merge(x, df, by="CompoundName")
+# Summarize by Strain
+x3 <- x2 %>%
+  group_by(Strain) %>%
+  summarise(maxProb = max(PredProbability, na.rm=TRUE),
+            minProb = min(PredProbability, na.rm=TRUE),
+            meanProb= mean(PredProbability, na.rm=TRUE),
+            medianProb=median(PredProbability, na.rm=TRUE),
+            count = n()) %>%
+  arrange(desc(maxProb))
+
+write.csv(x3, "UnlabeledStrainResults.csv", row.names=FALSE)
+
+# Another approach: Order compounds by predicted probability
+x2b <- x2 %>%
+  distinct(CompoundName, .keep_all=TRUE) %>%
+  arrange(desc(PredProbability)) %>%
+  select(CompoundName, PredProbability)
+write.csv(x2b, "UnlabeledCompoundResults.csv", row.names=FALSE)
+
+```
+
+
+```{r, toxicity, message=FALSE, warning=FALSE}
+tox <- read_csv("Batch_Oral_rat_LD50_Consensus.csv")
+met <- read_csv("prepared_data.csv")
+
+# Example: rename columns if needed
+tox$SMILES <- tox$Query
+
+# Merge toxicity with your set
+new <- left_join(tox, met, by="SMILES")
+
+
+# Convert numeric columns
+cols_to_num <- c("Pred_Value:_-Log10(mol/kg)")
+for(cc in cols_to_num) {
+  new[[cc]] <- as.numeric(new[[cc]])
+}
+
+library(ggpubr)
+
+p <- ggboxplot(new, x = "Fix", y = "Pred_Value:_-Log10(mol/kg)",
+               palette = "jco", add = "jitter") +
+  labs(x = "Diazotrophic or Not (1 = Diazotroph)",
+       y = "Rat Oral LD50 (-Log10(mol/kg))") +
+  stat_compare_means(method="t.test") +
+  ylim(0, 10)
+p
+
+# Daphnia data
+tox2 <- read_csv("Batch_Daphnia_magna_LC50_(48_hr)_AllMethods.csv")
+tox2$SMILES <- tox2$Query
+
+new2 <- merge(tox2, met, by="SMILES", all.x=TRUE)
+cols_to_num2 <- c("Pred_Consensus_-Log10(mol/L)")
+for(cc in cols_to_num2) {
+  new2[[cc]] <- as.numeric(new2[[cc]])
+}
+
+p2 <- ggboxplot(new2, x="Fix", y="Pred_Consensus_-Log10(mol/L)",
+                palette="jco", add="jitter") +
+  labs(x="Diazotrophic or Not (1 = Diazotroph)",
+       y="Daphnia magna LD50 (-Log10(mol/L))") +
+  ylim(0,10) +
+  stat_compare_means(method="t.test")
+
+# Combine
+library(patchwork)
+p + p2
+
+```
+
